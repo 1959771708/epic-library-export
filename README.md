@@ -4,14 +4,37 @@
 
 不需要输入账号密码，不需要 Epic 官方启动器，不上传任何数据。
 
+## 一键安装
+
+装好 [Tampermonkey](https://www.tampermonkey.net/)（Edge 商店 ID `iikmkjmpaadaobahmlepeloendndfphd`）之后，点下面这个链接，浏览器会弹出 Tampermonkey 的安装确认页，点「安装」即可：
+
+### 👉 [点此安装 Epic 库存导出](https://raw.githubusercontent.com/1959771708/epic-library-export/main/epic-library-export.user.js)
+
+安装完成后脚本会**自动检查并接收更新**，无需手动重新安装。
+
+## 自动更新
+
+脚本头部内置了两条指令，都指向本仓库的 raw 地址：
+
+```
+@updateURL    https://raw.githubusercontent.com/1959771708/epic-library-export/main/epic-library-export.user.js
+@downloadURL  https://raw.githubusercontent.com/1959771708/epic-library-export/main/epic-library-export.user.js
+```
+
+工作方式：
+
+- Tampermonkey 会按自己的周期（默认每天一次）去拉 `@updateURL`，比对里面的 `@version` 是否比本地高。
+- 发现有新版本时，脚本列表里会出现更新标记，Tampermonkey 自动下载 `@downloadURL` 指向的新文件并替换。
+- 想立刻检查：打开 Tampermonkey 面板 → 已安装脚本 → 「检查用户脚本更新」。
+- 更新只覆盖代码，不改你的导出结果，也不会重置任何设置。
+
+所以只要仓库里 `epic-library-export.user.js` 的 `@version` 递增并推到 `main` 分支，所有已安装的用户下次检查时就会自动升级。
+
 ## 为什么需要它
 
-Epic 商店**没有**自己的库导出功能：
+Epic 商店**没有**自己的库导出功能：`store.epicgames.com/library` 这条路径最终返回 **404**（实测整条重定向链：301 → 302 → 302 → login → callback → 404），不存在可抓的同源库接口。
 
-- `store.epicgames.com/library` 这条路径最终返回 **404**（实测整条重定向链：301 → 302 → 302 → login → callback → 404），不存在可抓的同源库接口。
-- GitHub 上现有的两个导出工具（`RefaelCohe/epic-games-Library-viewer`、`joex92/Epic-Games-One-Click-Library-Exporter`）打的都是 `ajaxGetOrderHistory` —— 那是**交易流水**，只有「下过单」才会留下记录。
-
-问题在于：Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接发放权益的，根本不产生订单。以实测账号为例：
+更关键的是口径问题 —— **交易流水（订单）和库存（library）是两套不同的数据**：
 
 | 口径 | 数量 |
 |---|---|
@@ -21,18 +44,11 @@ Epic 商店**没有**自己的库导出功能：
 | **只在库存里、账单完全没有** | **71** |
 | 只在账单里（DLC / 皮肤 / 货币包） | 6 |
 
-按游戏名归一化后，**用账单口径会漏掉 67 款**，其中包含 DEATHLOOP、RAGE 2、Ghostwire Tokyo、Farming Simulator 19、Elite Dangerous、High On Life、Tales from the Borderlands、Trine 系列等。
+Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接发放权益的，根本不产生订单。按游戏名归一化后，**只看订单流水会漏掉 67 款**，其中包含 DEATHLOOP、RAGE 2、Ghostwire Tokyo、Farming Simulator 19、Elite Dangerous、High On Life、Tales from the Borderlands、Trine 系列等。
 
-这 71 个 namespace **全部**能在 `entitlement-public-service` 里查到 `ACTIVE` 权益记录 —— 也就是说，数据一直都在，只是那类工具查错了接口。
+这 71 个 namespace **全部**能在 `entitlement-public-service` 里查到 `ACTIVE` 权益记录 —— 数据一直都在，只是不在订单里。
 
 本脚本查的是 `library-service`，所以能拿到完整库存。
-
-## 安装
-
-1. 浏览器装 [Tampermonkey](https://www.tampermonkey.net/)（Edge 商店 ID `iikmkjmpaadaobahmlepeloendndfphd`，本脚本在 5.5.x 上实测通过）。
-2. 点本仓库 `epic-library-export.user.js` 的 raw 链接，Tampermonkey 会弹出安装页，确认即可。
-
-脚本已内置 `@updateURL` / `@downloadURL`，指向本仓库的 raw 地址。Tampermonkey 会定期检查更新，也可以在它的面板里点「检查用户脚本更新」手动触发。
 
 ## 使用
 
