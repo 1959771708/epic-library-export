@@ -1,0 +1,10 @@
+# 本地导出产物（含账号信息，不要提交）
+epic-library-*.json
+epic-library-*.csv
+*.local.*
+
+# 临时文件
+.scratch/
+node_modules/
+.DS_Store
+Thumbs.db
