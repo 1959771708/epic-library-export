@@ -32,12 +32,7 @@ Epic 商店**没有**自己的库导出功能：
 1. 浏览器装 [Tampermonkey](https://www.tampermonkey.net/)（Edge 商店 ID `iikmkjmpaadaobahmlepeloendndfphd`，本脚本在 5.5.x 上实测通过）。
 2. 点本仓库 `epic-library-export.user.js` 的 raw 链接，Tampermonkey 会弹出安装页，确认即可。
 
-脚本目前**没有**内置 `@updateURL` / `@downloadURL`。你把它发布到自己的 GitHub 仓库后，在文件头的 UserScript 块里补上这两行，就能在 Tampermonkey 面板里一键检查更新：
-
-```js
-// @updateURL    https://raw.githubusercontent.com/<用户名>/<仓库名>/main/epic-library-export.user.js
-// @downloadURL  https://raw.githubusercontent.com/<用户名>/<仓库名>/main/epic-library-export.user.js
-```
+脚本已内置 `@updateURL` / `@downloadURL`，指向本仓库的 raw 地址。Tampermonkey 会定期检查更新，也可以在它的面板里点「检查用户脚本更新」手动触发。
 
 ## 使用
 
