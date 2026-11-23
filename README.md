@@ -2,8 +2,6 @@
 
 一个油猴（Tampermonkey）脚本，导出 Epic Games 账号的**真实游戏库存**，输出 JSON / CSV 给任意第三方工具（如小黑盒小程序）导入。
 
-不需要输入账号密码，不需要 Epic 官方启动器，不上传任何数据。
-
 ## 一键安装
 
 装好 [Tampermonkey](https://www.tampermonkey.net/)（Edge 商店 ID `iikmkjmpaadaobahmlepeloendndfphd`）之后，点下面这个链接，浏览器会弹出 Tampermonkey 的安装确认页，点「安装」即可：
