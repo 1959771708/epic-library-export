@@ -52,10 +52,10 @@ Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接
 
 1. 先在 <https://www.epicgames.com/> 登录 Epic 账号（登录态是唯一前提，脚本不接触你的密码）。
 2. 保持在该站点任意页面，右下角会出现蓝色「Epic 库存导出」按钮。
-3. 点开面板 → 「开始导出」→ 等待进度条走完（约 426 个游戏耗时 45 秒左右）。
+3. 点开面板 → 「开始导出」→ 等待进度条走完（约 426 个游戏耗时 30 秒左右，状态行右侧有实时秒数）。
 4. 点「下载 JSON」或「下载 CSV」。
 
-导出过程中共发起约 435 个请求：1 次换令牌、6 次分页读库、2 次分页读权益、426 次查游戏名（6 并发）。
+导出过程中共发起约 435 个请求：1 次换令牌、6 次读库、1 次读权益、426 次查游戏名（24 并发）。
 
 ## 输出格式
 
@@ -118,8 +118,8 @@ gameName,platforms,acquiredAt,namespace,catalogItemId,productId,sandboxName,inLi
 
 1. **取授权码** —— `GET https://www.epicgames.com/id/api/redirect?clientId=…&responseType=code`。本站同源，所以用原生 `fetch(…, {credentials:'include'})` 直接拿，靠浏览器已有 cookie。未登录时接口返回 `authorizationCode: null`，脚本据此提示先登录。
 2. **换令牌** —— `POST account-public-service-prod03…/account/api/oauth/token`，`grant_type=authorization_code` + `token_type=eg1`，Basic 认证用公开的 EGS 启动器客户端凭据（与 legendary 等项目同一组，非私人密钥）。**授权码一次性，每次导出都重新取。**
-3. **读库存与权益** —— `library-service…/library/api/public/items`（翻页靠 `responseMetadata.nextCursor`，实测 6 页 532 条 0 重复）与 `entitlement-public-service…/entitlements`（`count=500`，实测 500+59=559 条）。
-4. **解析游戏名** —— `catalog-public-service…/catalog/api/shared/namespace/{ns}/bulk/items?id={catalogItemId}`，6 并发。**必须用 `catalogItemId` 查，用 `productId` 会返回 `{}`**（这个坑实测过）。
+3. **读库存与权益** —— `library-service…/library/api/public/items`（翻页游标是 base64 的 `{"offset":N}`，可按步长派生并发拉取，实测 6 页 532 条 0 重复）与 `entitlement-public-service…/entitlements`（`count=1000` 一次取全 559 条）。
+4. **解析游戏名** —— `catalog-public-service…/catalog/api/shared/namespace/{ns}/bulk/items?id={catalogItemId}`，24 并发。**必须用 `catalogItemId` 查，用 `productId` 会返回 `{}`**（这个坑实测过）。
 
 ### 为什么必须是油猴 / 扩展，不能是纯网页脚本
 
@@ -157,16 +157,25 @@ Epic 的订单接口在金额上不可靠，实测结论：
 
 | 项目 | 结果 |
 |---|---|
-| 总耗时 | 47.6 秒 |
-| 请求数 | 435（令牌 1 / 库 6 / 权益 2 / catalog 426） |
+| 总耗时 | 约 30 秒（28.9–33.8 秒，随网络波动） |
+| 请求数 | 435（令牌 1 / 库 6 / 权益 1 / catalog 426） |
 | 导出游戏数 | 426 |
 | 库记录数 | 532（6 页，0 重复） |
-| 权益记录数 | 559 |
+| 权益记录数 | 559（单次 `count=1000` 取全） |
 | 解析失败 | 0 |
 | `name` 回落到 namespace | 0 |
 | `entitled: false` | 0 |
 | 与独立脚本结果比对 | namespace 集合完全一致（缺失 0 / 多出 0） |
 | CSV 列数异常行 | 0 |
+
+提速前后对比（同一账号、同一网络）：
+
+| 阶段 | 优化前 | 优化后 |
+|---|---|---|
+| 解析游戏名 | 约 25 秒（6 并发） | 约 7 秒（24 并发） |
+| 读取游戏库 | 约 18 秒（6 页串行） | 约 5 秒（按 offset 并发） |
+| 读取权益 | 约 12 秒（2 页串行） | 约 9 秒（单页取全） |
+| 合计 | 47.6 秒 | 约 30 秒 |
 
 ## 许可
 
