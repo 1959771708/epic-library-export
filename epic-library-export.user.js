@@ -2,7 +2,7 @@
 // @name         Epic 库存导出
 // @name:en      Epic Library Export
 // @namespace    https://github.com/1959771708/epic-library-export
-// @version      1.0.0
+// @version      1.0.1
 // @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON / CSV 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
@@ -112,10 +112,12 @@
 
     // ── Epic 接口 ───────────────────────────────────────────────────────────
     // 第 1 步：取一次性授权码。本站同源时直接 fetch，跨站时交给 GM。
+    // 注意：这个接口会校验参数白名单，任何多余参数（含常见的防缓存 `_=`）都会返回
+    // HTTP 400 "`_` is not allowed"，所以 URL 必须严格只有 clientId 和 responseType。
     async function fetchAuthCode() {
         const url = 'https://www.epicgames.com/id/api/redirect'
             + '?clientId=' + CLIENT_ID
-            + '&responseType=code&_=' + Date.now();
+            + '&responseType=code';
 
         let text;
         if (location.hostname === 'www.epicgames.com') {
