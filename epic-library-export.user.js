@@ -6,7 +6,7 @@
 // @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
-// @license      MIT
+// @license      CC-BY-4.0
 // @homepageURL  https://github.com/1959771708/epic-library-export
 // @supportURL   https://github.com/1959771708/epic-library-export/issues
 // @updateURL    https://raw.githubusercontent.com/1959771708/epic-library-export/main/epic-library-export.user.js
