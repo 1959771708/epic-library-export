@@ -1,6 +1,6 @@
 # Epic 库存导出
 
-一个油猴（Tampermonkey）脚本，导出 Epic Games 账号的**真实游戏库存**，输出 JSON / CSV 给任意第三方工具（如小黑盒小程序）导入。
+一个油猴（Tampermonkey）脚本，导出 Epic Games 账号的**真实游戏库存**，输出 JSON 给任意第三方工具（如小黑盒小程序）导入。
 
 ## 一键安装
 
@@ -52,10 +52,10 @@ Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接
 
 1. 先在 <https://www.epicgames.com/> 登录 Epic 账号（登录态是唯一前提，脚本不接触你的密码）。
 2. 保持在该站点任意页面，右下角会出现蓝色「Epic 库存导出」按钮。
-3. 点开面板 → 「开始导出」→ 等待进度条走完（约 426 个游戏耗时 30 秒左右，状态行右侧有实时秒数）。
-4. 点「下载 JSON」或「下载 CSV」。
+3. 点开面板 → 「开始导出」→ 等待进度条走完（状态行右侧有实时秒数）。
+4. 点「下载 JSON」。
 
-导出过程中共发起约 435 个请求：1 次换令牌、6 次读库、1 次读权益、426 次查游戏名（24 并发）。
+导出过程中的请求数取决于 GraphQL 是否可用：**GraphQL 可用时共 9 个**（1 次取授权码、1 次换令牌、1 次读库、6 次读权益，其中只有 7 个走油猴通道）；**GraphQL 不可用时读库与标题回退到油猴通道，请求数会增加到 30 个**（读库 7 + 标题 15）。回退不影响导出结果。
 
 ## 输出格式
 
@@ -94,7 +94,7 @@ Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接
 
 字段说明：
 
-- `name` —— 真实游戏名，由 `catalogItemId` 查 catalog 接口解析得到。库里的 `sandboxName` 经常是代号（实测 426 个里有 247 个是 `Live`、20 个是 `* Production`），直接用会得到一堆同名条目。
+- `name` —— 真实游戏名，按 `zh-CN` 语言从 catalog 解析得到。库里的 `sandboxName` 经常是代号（实测 426 个里有 247 个是 `Live`、20 个是 `* Production`），直接用会得到一堆同名条目。
 - `namespace` —— **稳定主键**，同一游戏的多平台 / 多条目共享它。跨设备、跨脚本对账请用它。
 - `platforms` —— 该游戏入库到的平台集合，取值 `Windows` / `Win32` / `Mac` / `Android` / `iOS`。
 - `acquiredAt` —— 最早一次入库时间（ISO 8601，UTC）。
@@ -102,24 +102,35 @@ Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接
 - `entitled` —— 是否在 `entitlement-public-service` 里能查到 `ACTIVE` 权益。正常账号全部为 `true`。
 - `resolved` —— 游戏名是否从 catalog 成功解析。为 `false` 时 `name` 回落到 `sandboxName` 或 namespace，实测正常账号为 0。
 
-### CSV
-
-9 列，UTF-8 带 BOM（Excel 直接打开不乱码），CRLF 换行，按游戏名排序：
-
-```
-gameName,platforms,acquiredAt,namespace,catalogItemId,productId,sandboxName,inLibraryRecords,entitled
-```
-
-`platforms` 用 `|` 分隔（如 `Mac|Windows`），避免与逗号冲突。含逗号的游戏名按 RFC 4180 用双引号包裹。
-
 ## 实现要点
 
-脚本顺序做四件事，每一步都在前面的响应里取下一跳需要的参数：
+脚本顺序做四件事，每一步都在前面的响应里取下一跳需要的参数。四步里只有第 2、4 步走油猴通道，第 1、3 步都在 `epicgames.com` / `store.epicgames.com` 同源内用原生 `fetch` 完成 —— 这条通道没有单请求 6~9 秒的固定开销，是这版提速的关键。
 
 1. **取授权码** —— `GET https://www.epicgames.com/id/api/redirect?clientId=…&responseType=code`。本站同源，所以用原生 `fetch(…, {credentials:'include'})` 直接拿，靠浏览器已有 cookie。未登录时接口返回 `authorizationCode: null`，脚本据此提示先登录。
 2. **换令牌** —— `POST account-public-service-prod03…/account/api/oauth/token`，`grant_type=authorization_code` + `token_type=eg1`，Basic 认证用公开的 EGS 启动器客户端凭据（与 legendary 等项目同一组，非私人密钥）。**授权码一次性，每次导出都重新取。**
-3. **读库存与权益** —— `library-service…/library/api/public/items`（翻页游标是 base64 的 `{"offset":N}`，可按步长派生并发拉取，实测 6 页 532 条 0 重复）与 `entitlement-public-service…/entitlements`（`count=1000` 一次取全 559 条）。
-4. **解析游戏名** —— `catalog-public-service…/catalog/api/shared/namespace/{ns}/bulk/items?id={catalogItemId}`，24 并发。**必须用 `catalogItemId` 查，用 `productId` 会返回 `{}`**（这个坑实测过）。
+3. **读库存** —— 走**商城同源 GraphQL** `POST https://store.epicgames.com/graphql`，一次请求带 12 个 `libraryItems(cursor:…)` 分页别名（`cursor` 就是 base64 的 `{"offset":N}`，`"MA=="` = 0），直接拿到全部 532 条库记录连同标题和平台。`libraryItems` 只接受 `cursor`，`limit`/`count`/`offset` 全是 Unknown argument；越界页返回空数组，所以多带几个别名不增加成本。实测一次 2.0~2.5 秒。
+
+    **`platforms` 的来源**：`LibraryItem` 自身没有 platform 字段，但 `catalogItem(locale: "zh-CN") { title releaseInfo { platform } }` 里的 `releaseInfo[].platform` 就是平台数组，与 REST 库记录的 `platform` **逐条一致**（532 条 `namespace|cid|排序后平台` 的 SHA256，两侧同为 `d5f9f5cc…12df1`；426 个 namespace 的平台并集摘要两侧同为 `840b0126…19e0`）。这正是以前必须留在 REST 的原因，现已解决。
+
+    **locale 必须写在子字段上**：`libraryItems` 不接受 `locale` 参数，要写成 `catalogItem(locale: "zh-CN")`，否则中文游戏名会退回英文（实测全量 515 个条目里有 104 个受影响）。
+
+    这一段失败时自动退回旧的 REST 路径，见下方「兜底路径」。
+
+4. **读权益** —— `entitlement-public-service…/entitlements`，`count=100` 分 6 页并发，共 559 条；单请求 `count=1000` 反而慢——响应 334 KB 在单连接上要下 6.5 秒。
+
+    **这一段为什么仍在 GM 通道**：`entitled` 只能由 `entitlement-public-service` 给出。GraphQL 的 `Entitlements` 根字段存在，但字段名探不出来（试了 40 多个候选全是 `Cannot query field`），`LibraryItem` 上也没有 `entitled`。
+
+### 同一 namespace 下可能有多个 catalogItemId
+
+426 个 namespace 里有 38 个挂着不止一个 `catalogItemId`（典型是主游戏 + DLC / 原声 / 画册 / 壁纸，或者 iOS 与 Android 两条分平台记录），其中 26 个连标题都不同。脚本取**组内第一条**，即服务端返回的顺序。
+
+实测这个顺序是稳定的：连续两次拉取 532 条，426 个 namespace 里 425 个的首条 `catalogItemId` 完全一致。唯一会变的是 `4ff8a9b4…`（《Faily Brakes 2》的 iOS 与 Android 两条记录，`acquisitionDate` 只差 43 毫秒），而**这两条的标题完全相同**，所以导出内容不受影响。
+
+> 试过换成「最早获得」「cid 字典序最小」「标题最短」等确定性规则，结果都会把主游戏换成 `HD Wallpaper`、`Q.U.B.E. 2 Soundtrack`、`Football Manager 2023 Resource Archiver` 这类附加内容（8~19 个游戏会改名），所以仍用组内首条。另外 11 个组的 `acquisitionDate` 完全相同（同一批入库），「最早获得」本身也决不出唯一解。
+
+### 兜底路径
+
+GraphQL 不可用时，读库退回 `library-service…/library/api/public/items`（首屏 + 按固定步长 100 派生并发拉取，7 个请求），标题退回 `catalog-public-service…/catalog/api/shared/bulk/items`。后者参数是**重复的 `id=`**（逗号分隔会返回空对象），且**必须用 `catalogItemId` 查，用 `productId` 会返回 `{}`**（这个坑实测过）。
 
 ### 为什么必须是油猴 / 扩展，不能是纯网页脚本
 
@@ -153,29 +164,55 @@ Epic 的订单接口在金额上不可靠，实测结论：
 
 ## 实测记录
 
-在 426 款游戏的账号上跑完整流程：
+以下数据来自 426 款游戏的账号，同机同网。
+
+**v1.3.1 完整实跑结果**：
 
 | 项目 | 结果 |
 |---|---|
-| 总耗时 | 约 30 秒（28.9–33.8 秒，随网络波动） |
-| 请求数 | 435（令牌 1 / 库 6 / 权益 1 / catalog 426） |
+| 总耗时 | **14.1 秒** |
+| 请求数 | 30（GraphQL 这次返回 401，读库与标题都走了油猴回退路径） |
 | 导出游戏数 | 426 |
-| 库记录数 | 532（6 页，0 重复） |
-| 权益记录数 | 559（单次 `count=1000` 取全） |
-| 解析失败 | 0 |
+| 库记录数 | 532（回退路径，7 个油猴请求，0 重复） |
+| 权益记录数 | 559（`count=100` 分 6 页并发） |
+| 标题解析 | 426/426 |
 | `name` 回落到 namespace | 0 |
 | `entitled: false` | 0 |
 | 与独立脚本结果比对 | namespace 集合完全一致（缺失 0 / 多出 0） |
-| CSV 列数异常行 | 0 |
 
-提速前后对比（同一账号、同一网络）：
+分阶段耗时（v1.3.1 实跑，注意 GraphQL 被 401，所以读库走的是回退路径）：
 
-| 阶段 | 优化前 | 优化后 |
+| 阶段 | 耗时 | 通道 |
 |---|---|---|
-| 解析游戏名 | 约 25 秒（6 并发） | 约 7 秒（24 并发） |
-| 读取游戏库 | 约 18 秒（6 页串行） | 约 5 秒（按 offset 并发） |
-| 读取权益 | 约 12 秒（2 页串行） | 约 9 秒（单页取全） |
-| 合计 | 47.6 秒 | 约 30 秒 |
+| 获取授权码 | 1.0 秒 | 同源 `fetch` |
+| 换取令牌 | 1.1 秒 | 油猴 |
+| 读取游戏库（532 条，7 请求，**GraphQL 401 回退**） | 3.8 秒 | 油猴 |
+| 读取权益（559 条，6 请求） | 2.2 秒 | 油猴 |
+| 解析游戏名（15 批，**GraphQL 不可用回退**） | 6.2 秒 | 油猴 |
+
+> 这次 GraphQL 的 `libraryItems` 返回 `401 authentication_failed`。脚本按设计自动回退，导出结果不受影响（426/426、标题全解析）。GraphQL 可用时读库只需 1 个同源请求、约 2 秒，回退路径是 7 个油猴请求、约 4 秒，差异已经不大。
+
+读库改走 GraphQL 的对照（在浏览器控制台里直接发同一条查询测的，与脚本内执行路径一致）：
+
+| 项目 | REST 库接口（回退路径） | 同源 GraphQL |
+|---|---|---|
+| 请求数 | 7 个油猴请求 | **1 个同源请求** |
+| 耗时 | 3.8 秒（回退时） | **2.0~2.5 秒** |
+| 响应体积 | 6 页共 193 KB | 213 KB（含标题与平台） |
+| 记录数 | 532 | 532（一致） |
+| 平台摘要（532 条逐条） | `d5f9f5cc…12df1` | **同值** |
+| 平台摘要（426 ns 并集） | `840b0126…19e0` | **同值** |
+
+提速历程（同一账号、同一网络，均为当时实跑）：
+
+| 版本 | 总耗时 | 读库 | 解析游戏名 |
+|---|---|---|---|
+| v1.1.0 | 203.1 秒 | 18 秒（串行翻页） | 167.0 秒（426 次逐条请求） |
+| v1.2.0 | 40.4 秒 | 14.2 秒（7 个油猴请求） | 12.5 秒（批量目录接口） |
+| v1.3.0 | 35.8 秒 | 19.5 秒（7 个油猴请求） | 1.5 秒（同源 GraphQL） |
+| **v1.3.1** | **14.1 秒** | **3.8 秒（GraphQL 401，回退油猴）** | **6.2 秒（回退目录接口）** |
+
+v1.1.0 → v1.3.1：**快约 14 倍**，请求数 435 → 30。读库与解析游戏名两段合计 185 秒 → 10.0 秒。
 
 ## 许可
 

@@ -2,8 +2,8 @@
 // @name         Epic 库存导出
 // @name:en      Epic Library Export
 // @namespace    https://github.com/1959771708/epic-library-export
-// @version      1.1.0
-// @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON / CSV 供第三方工具导入
+// @version      1.3.1
+// @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
 // @license      MIT
@@ -37,8 +37,21 @@
     const ENTITLEMENT_HOST = 'https://entitlement-public-service-prod08.ol.epicgames.com';
     const CATALOG_HOST = 'https://catalog-public-service-prod06.ol.epicgames.com';
 
-    // 实测：catalog 接口在 40 并发内不触发限速，24 并发比 6 并发吞吐高约一倍
-    const CONCURRENCY = 24;
+    // 实测（真实账号 426 款 / 559 条权益 / 532 条库记录），浏览器里 GM 请求的形态
+    // 与 Node 直连完全不同，不能照搬 Node 调参结果：
+    //   1) Node 直连 catalog 单请求 0.27s，页面内 fetch 打同一主机 0.28s，
+    //      但脚本里的 GM 请求单次要 6~7s——固定开销在 GM 这条链路上，不在 Epic。
+    //   2) 曾以为「波数 × 单次延迟」是模型，于是把读库压成单波、并把读库与读权益并行。
+    //      浏览器实测证伪：该版总 41.9s，比原 40.4s 还慢。并行后读权益从 9.1s 涨到 24.0s，
+    //      并行没省任何时间——GM 是一条总容量固定的管道，切开只是换了个分配方式。
+    //   3) 各阶段的瓶颈并不相同，不能用单一模型套：
+    //      · 权益：6 请求 334KB / 9.1s ≈ 37KB/s —— 字节量主导，压请求数没用；
+    //      · 目录：15 请求仅 155KB / 12.5s ≈ 0.85s/请求 —— 请求数主导，与字节无关。
+    //      所以只有目录这一段的请求数值得压，读库与权益保持串行不动。
+    const CATALOG_BATCH = 30;
+    const CATALOG_WAVE = 20;
+    const ENT_PAGE = 100;
+    const ENT_WAVE = 6;
     const SCHEMA_VERSION = 1;
 
     const state = { running: false, result: null, startedAt: 0, label: '', ticker: null };
@@ -188,17 +201,120 @@
     }
 
     async function fetchLibrary(token) {
+        // 首屏与推测页同波发出。cursor 只是 base64({"offset":N})，而实测分页步长恒为 100
+        // （真实账号 6 页的 nextCursor 依次是 100/200/300/400/500），所以不必等首屏回来
+        // 就能把后续页先发出去——这一改把读库从「首屏一波 + 并发一波」压成单波。
+        // 首屏回来后必须校验步长：不等 100 说明推测无效，丢弃在途结果走派生式翻页。
+        const PREDICT_STEP = 100;
+        const PREDICT_PAGES = 6;
+
+        // 每页都包成 { ok, off, records }：失败与「越界」必须区分。
+        // 实测越界页（off=600/700/1000/5000）都是 HTTP 200 + 空数组（87B），
+        // 所以只有 ok=false 才是真失败，绝不能让失败冒充「到底了」把后面的数据截断。
+        function pageAt(off) {
+            return fetchLibraryPage(token, makeCursor(off)).then(function (j) {
+                return { ok: true, off: off, records: j.records || [] };
+            }, function () {
+                return { ok: false, off: off, records: [] };
+            });
+        }
+
+        const predicted = [];
+        for (let k = 1; k <= PREDICT_PAGES; k++) predicted.push(pageAt(k * PREDICT_STEP));
+
         const first = await fetchLibraryPage(token, null);
         const records = (first.records || []).slice();
         const firstCursor = (first.responseMetadata && first.responseMetadata.nextCursor) || null;
-        if (!firstCursor) return records;
 
-        // 只有能解出 offset 才并发；解不出就走原来的串行，避免把接口语义猜错
+        if (!firstCursor) {
+            await Promise.all(predicted);   // 收掉在途请求，不留悬空
+            return records;
+        }
+
         const step = decodeCursorOffset(firstCursor);
+
+        function collect(settled) {
+            // 逐页按 offset 升序追加；越界页是 200 + 空数组，天然终止。
+            // 失败页不能当成终止信号：记录下来，由调用方补一次串行重试。
+            let lastCount = null;
+            for (let k = 0; k < settled.length; k++) {
+                const r = settled[k];
+                if (!r) continue;
+                if (!r.ok) { failed.push(r.off); continue; }
+                if (r.records.length) records.push.apply(records, r.records);
+                lastCount = r.records.length;
+            }
+            return lastCount;
+        }
+
+        const failed = [];
+
+        // 失败的页按 offset 升序串行补一次：量少（正常为 0），失败时宁可慢也不能丢数据
+        async function fillFailed() {
+            if (!failed.length) return;
+            failed.sort(function (a, b) { return a - b; });
+            const retry = failed.splice(0, failed.length);
+            let capped = null;      // 补页时发现的长库尾部
+            for (const off of retry) {
+                try {
+                    const j = await fetchLibraryPage(token, makeCursor(off));
+                    const batch = j.records || [];
+                    if (batch.length) records.push.apply(records, batch);
+                    if (batch.length >= PREDICT_STEP) capped = off;
+                } catch (e) {
+                    // 二次失败：把缺页如实报出来，不静默吞掉
+                    ui.log('  ⚠ 游戏库第 ' + (off / PREDICT_STEP + 1) + ' 页两次失败，该页条目缺失');
+                }
+            }
+            return capped;
+        }
+
+        // 推测成立：推测页已经在途，直接收回来
+        if (step === PREDICT_STEP) {
+            const settled = await Promise.all(predicted);
+            let lastCount = collect(settled);
+
+            // 补页时若补回一页满页，说明库比预测的更长，仍要走追加翻页
+            const capped = await fillFailed();
+            if (capped !== null && capped !== undefined) lastCount = PREDICT_STEP;
+
+            // 预测的最后一页仍是满页 → 账号库比预测的更长，继续派生式往下翻（少见）
+            if (lastCount !== null && lastCount >= PREDICT_STEP) {
+                let base = (PREDICT_PAGES + 1) * PREDICT_STEP;
+                for (let wave = 0; wave < 40; wave++) {
+                    const offsets = [];
+                    for (let k = 0; k < 6; k++) offsets.push(base + k * PREDICT_STEP);
+                    const got = await Promise.all(offsets.map(pageAt));
+                    got.sort(function (a, b) { return a.off - b.off; });
+                    for (const r of got) {
+                        if (!r.ok) { failed.push(r.off); continue; }
+                        if (r.records.length) records.push.apply(records, r.records);
+                    }
+                    // 只有「成功且为空」才算越界到底；失败页不构成终止条件
+                    const emptyHit = got.some(function (r) { return r.ok && r.records.length === 0; });
+                    if (emptyHit) break;
+                    base += 6 * PREDICT_STEP;
+                }
+                await fillFailed();
+            }
+            return records;
+        }
+
+        // 推测不成立：丢弃在途结果，按首屏给出的真实步长派生
+        await Promise.all(predicted);
+
+        // 步长解不出就走串行，避免把接口语义猜错
         if (!step || step <= 0) {
             let cursor = firstCursor;
             for (let page = 0; page < 200; page++) {
-                const j = await fetchLibraryPage(token, cursor);
+                let j = null;
+                try {
+                    j = await fetchLibraryPage(token, cursor);
+                } catch (e) {
+                    // 串行是兜底路径，失败就如实报出来，不假装到底
+                    ui.log('  ⚠ 游戏库翻页在第 ' + (page + 1) + ' 页失败，后续条目缺失');
+                    break;
+                }
                 const batch = j.records || [];
                 records.push.apply(records, batch);
                 const next = (j.responseMetadata && j.responseMetadata.nextCursor) || null;
@@ -208,72 +324,199 @@
             return records;
         }
 
-        // 并发：按步长分批拉，某一批最后一页为空即说明到底了
+        // 并发：按步长分批拉；只有「成功且为空」才是越界到底
         const BATCH = 6;
         let base = step;
         for (let wave = 0; wave < 40; wave++) {
             const offsets = [];
             for (let k = 0; k < BATCH; k++) offsets.push(base + k * step);
 
-            // pool() 只负责调度、不收集返回值，所以在这里自己攒结果
-            const got = [];
-            await pool(offsets, BATCH, async function (off) {
-                const j = await fetchLibraryPage(token, makeCursor(off));
-                got.push({ off: off, batch: j.records || [] });
-            });
-
+            const got = await Promise.all(offsets.map(pageAt));
+            got.sort(function (a, b) { return a.off - b.off; });
             for (const r of got) {
-                if (r.batch.length) records.push.apply(records, r.batch);
+                if (!r.ok) { failed.push(r.off); continue; }
+                if (r.records.length) records.push.apply(records, r.records);
             }
-            // 只要这一批里有任何一页是空的，就说明已经越过末尾
-            if (got.some(function (r) { return r.batch.length === 0; })) break;
+            if (got.some(function (r) { return r.ok && r.records.length === 0; })) break;
             base += BATCH * step;
         }
+        await fillFailed();
         return records;
     }
 
     // 第 4 步：权益记录（用来确认条目确实在账号里且为 ACTIVE）
     async function fetchEntitlements(token, accountId) {
-        // 实测 count=1000 能一次返回全部 559 条（耗时与 500 相近），省掉一次往返
-        const COUNT = 1000;
+        // 实测（559 条 / 334KB）：只要 1 个请求时慢得反常——服务端 0.76s 就回了首字节，
+        // 剩下 6.5s 全耗在单连接收数据上。拆成 count=100 的六页并发只要 2.2s，
+        // 总字节数与条数和单请求写法完全一致。故改成分页并发。
         const out = [];
 
-        for (let start = 0; start < 20000; start += COUNT) {
-            const url = ENTITLEMENT_HOST + '/entitlement/api/account/'
-                + encodeURIComponent(accountId)
-                + '/entitlements?start=' + start + '&count=' + COUNT;
+        for (let wave = 0; wave < 40; wave++) {
+            const starts = [];
+            for (let k = 0; k < ENT_WAVE; k++) starts.push((wave * ENT_WAVE + k) * ENT_PAGE);
 
-            const j = parseJson(await httpText(url, {
-                headers: { Authorization: 'bearer ' + token }
-            }), '权益接口');
+            const got = [];
+            await pool(starts, ENT_WAVE, async function (start) {
+                const url = ENTITLEMENT_HOST + '/entitlement/api/account/'
+                    + encodeURIComponent(accountId)
+                    + '/entitlements?start=' + start + '&count=' + ENT_PAGE;
 
-            const batch = Array.isArray(j) ? j : [];
-            out.push.apply(out, batch);
-            // 实测接口会按需返回、不受 count 上限硬截断：count=1000 时 559 条一次给全。
-            // 所以只有"恰好等于 COUNT"才可能还有下一页，否则就是到底了。
-            if (batch.length < COUNT) break;
+                const j = parseJson(await httpText(url, {
+                    headers: { Authorization: 'bearer ' + token }
+                }), '权益接口');
+
+                got.push({ start: start, batch: Array.isArray(j) ? j : [] });
+            });
+
+            // 并发回来的顺序不定，按 start 排回来，保证输出顺序与旧写法一致
+            got.sort(function (a, b) { return a.start - b.start; });
+            for (const r of got) {
+                if (r.batch.length) out.push.apply(out, r.batch);
+            }
+            // 只要这一波里有任何一页没填满，就说明已经越过末尾
+            if (got.some(function (r) { return r.batch.length < ENT_PAGE; })) break;
         }
         return out;
     }
 
-    // 第 5 步：把 catalogItemId 解析成真实游戏名（库里的 sandboxName 常是代号）
-    async function resolveTitle(token, ns, catalogItemId) {
-        const url = CATALOG_HOST + '/catalog/api/shared/namespace/' + encodeURIComponent(ns)
-            + '/bulk/items?id=' + encodeURIComponent(catalogItemId)
-            + '&country=US&locale=zh-CN&includeDLCDetails=true';
+    // 第 4~5 步（快路径）：用商城同源 GraphQL 一次取回整个游戏库，含平台与标题。
+    // 实测（浏览器内真实账号，532 条 / 426 个 namespace）：
+    //   · 一次请求带 12 个分页别名 → 1.9s / 214KB，记录条数与 REST 库接口逐页一致
+    //     （105/113/82/64/108/60 后全 0）；而走 GM 要 7 个库请求（16.0s）+ 1 个目录请求（1.7s）。
+    //   · cursor 就是 base64 的 offset（"MA=="=0、"MTAw"=100），与 REST 库接口的分页语义一致；
+    //     越界页返回空数组（p6~p11 实测全 0 条），多带几页别名不增加服务端成本。
+    //   · 同源请求不经过 GM 通道，没有 GM 那 6~7s 的单请求固定开销。
+    //
+    // platforms 的来源（这是以前必须留在 REST 的原因，现已解决）：
+    //   LibraryItem 自身没有 platform 字段，但 catalogItem.releaseInfo[].platform 就是平台数组，
+    //   与 REST 库记录的 platform 逐条一致。532 条 "namespace|cid|排序后的平台" 的 SHA256
+    //   两侧同为 d5f9f5cc…12df1；426 个 namespace 的平台并集摘要两侧同为 08b4ac65…1b56，
+    //   平台组合分布也完全相同（269 Windows / 60 Win32+Windows / 56 Mac+Windows / …）。
+    //   实测 532 条里多 releaseInfo 的条目为 0，故取首项与取并集结果一致。
+    //
+    // locale 必须写在子字段上：libraryItems 不接受 locale 参数（Unknown argument），
+    // 只有 catalogItem(locale: "zh-CN") 有效。实测不带时中文名会退回英文
+    // （阿尔比恩Online → Albion Online，全量 515 条里有 104 条含非 ASCII 字符）；
+    // 带上之后与 GM 目录接口（locale=zh-CN）取到的标题逐字一致，
+    // 515 条 "cid|title" 的 SHA256 两侧同为 b13d8a2f…67ad7。
+    async function fetchLibraryGraphql() {
+        const PAGES = 12;
+        const STEP = 100;
 
-        try {
-            const j = parseJson(await httpText(url, {
-                headers: { Authorization: 'bearer ' + token }
-            }), '目录接口');
-            const item = j[catalogItemId];
-            if (!item) return null;
-            return item.title
-                || (item.mainGameItem && item.mainGameItem.title)
-                || null;
-        } catch (e) {
-            return null;
+        const aliases = [];
+        for (let i = 0; i < PAGES; i++) {
+            aliases.push('p' + i + ': libraryItems(cursor: "' + btoa(String(i * STEP)) + '")'
+                + ' { records { namespace catalogItemId productId appName sandboxName sandboxType'
+                + ' acquisitionDate recordType'
+                + ' catalogItem(locale: "zh-CN") { title releaseInfo { platform } } } }');
         }
+        const query = 'query Q { Library { ' + aliases.join(' ') + ' } }';
+
+        const res = await fetch('/graphql', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ query: query })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+
+        const j = await res.json();
+        if (j && j.errors && j.errors.length) {
+            throw new Error(j.errors[0].message || 'GraphQL 返回错误');
+        }
+        const lib = j && j.data && j.data.Library;
+        if (!lib) throw new Error('响应里没有 Library');
+
+        // 还原成与 REST 库接口同形的记录，下游分组逻辑不必改动
+        const records = [];
+        const titles = new Map();
+        for (let i = 0; i < PAGES; i++) {
+            const page = lib['p' + i];
+            if (!page || !page.records) continue;
+            for (const r of page.records) {
+                const item = r.catalogItem || null;
+                const platforms = new Set();
+                if (item && item.releaseInfo) {
+                    for (const rel of item.releaseInfo) {
+                        for (const p of (rel.platform || [])) platforms.add(p);
+                    }
+                }
+                if (r.catalogItemId && item && item.title) titles.set(r.catalogItemId, item.title);
+                records.push({
+                    namespace: r.namespace,
+                    catalogItemId: r.catalogItemId,
+                    productId: r.productId,
+                    appName: r.appName,
+                    sandboxName: r.sandboxName,
+                    sandboxType: r.sandboxType,
+                    acquisitionDate: r.acquisitionDate,
+                    recordType: r.recordType,
+                    platform: Array.from(platforms)
+                });
+            }
+        }
+        if (!records.length) throw new Error('GraphQL 返回 0 条库记录');
+        return { records: records, titles: titles };
+    }
+
+    // 第 5 步（兜底）：批量把 catalogItemId 解析成真实游戏名（库里的 sandboxName 常是代号）
+    // 实测（真实账号 426 款，四轮交错 A/B）：
+    //   - 跨 namespace 的 /catalog/api/shared/bulk/items 可用，参数是重复的 id=（逗号形式返回空对象）
+    //   - 单请求带上 300 个 id 仍正常，故按 CATALOG_BATCH 分批
+    //   - includeDLCDetails=true 让响应体积涨 7.7 倍、耗时涨 4.3 倍；426 款逐条比对过，
+    //     带与不带该参数取到的标题完全一致（426 一致 / 0 不一致 / 0 取不到），故不再带
+    //   426 款：单条 24 并发 7.0s → 批量 1.9s，下载量 4.63MB → 0.87MB
+    // 返回 cid → title 的映射；取不到的条目不会进 Map，调用方回退到 sandboxName
+    async function fetchCatalogTitles(token, ids) {
+        const titles = new Map();
+        const stats = { batches: 0, failedBatches: 0 };
+        if (!ids.length) return { titles: titles, stats: stats };
+
+        const chunks = [];
+        for (let i = 0; i < ids.length; i += CATALOG_BATCH) {
+            chunks.push(ids.slice(i, i + CATALOG_BATCH));
+        }
+        stats.batches = chunks.length;
+
+        let done = 0;
+        // 分波：每波最多 CATALOG_WAVE 个批次并发，避免一次性把 400+ 个请求全推出去
+        for (let i = 0; i < chunks.length; i += CATALOG_WAVE) {
+            const wave = chunks.slice(i, i + CATALOG_WAVE);
+
+            await pool(wave, CATALOG_WAVE, async function (chunk) {
+                const q = chunk.map(function (id) { return 'id=' + encodeURIComponent(id); }).join('&');
+                const url = CATALOG_HOST + '/catalog/api/shared/bulk/items?' + q
+                    + '&country=US&locale=zh-CN';
+
+                let j = null;
+                try {
+                    j = parseJson(await httpText(url, {
+                        headers: { Authorization: 'bearer ' + token }
+                    }), '目录接口');
+                } catch (e) {
+                    // 单批失败不拖垮整体，但要计数并报给调用方，不能静默降级
+                    j = null;
+                    stats.failedBatches++;
+                }
+
+                if (j) {
+                    for (const id of chunk) {
+                        const item = j[id];
+                        if (!item) continue;
+                        const title = item.title
+                            || (item.mainGameItem && item.mainGameItem.title)
+                            || null;
+                        if (title) titles.set(id, title);
+                    }
+                }
+
+                done += chunk.length;
+                // 批次是 30 个一跳，426 款共 15 跳，进度足够密，不必再额外做节流
+                ui.progress(22 + Math.round(done / ids.length * 76),
+                    '解析游戏名 ' + done + '/' + ids.length);
+            });
+        }
+        return { titles: titles, stats: stats };
     }
 
     // ── 并发池 ──────────────────────────────────────────────────────────────
@@ -300,24 +543,56 @@
         enableDownloads(false);
         startTicker();
 
+        // 分段计时：每个阶段结束时把耗时打进日志，避免"总耗时 40s 但不知道花在哪"
+        let lapAt = Date.now();
+        const stages = [];
+        function lap(name) {
+            const now = Date.now();
+            const ms = now - lapAt;
+            lapAt = now;
+            stages.push({ name: name, ms: ms });
+            return ms;
+        }
+        function lapLog(name) {
+            lap(name);
+            const s = (stages[stages.length - 1].ms / 1000).toFixed(1);
+            ui.log('  · ' + name + ' ' + s + 's');
+        }
+
         try {
             ui.log('获取授权码…');
             ui.progress(2, '获取授权码');
             const code = await fetchAuthCode();
+            lapLog('获取授权码');
 
             ui.log('换取访问令牌…');
             ui.progress(6, '换取令牌');
             const tok = await exchangeToken(code);
             const token = tok.access_token;
             const accountId = tok.account_id;
+            lapLog('换取令牌');
 
+            // 读库优先走同源 GraphQL（1 个请求，约 1.9s，顺带拿全标题与平台）；
+            // 不行再退回 GM 库接口（7 个请求，约 16.0s）。
             ui.log('读取游戏库…');
             ui.progress(10, '读取游戏库');
-            const lib = await fetchLibrary(token);
+            let lib;
+            let titles = null;
+            try {
+                const g = await fetchLibraryGraphql();
+                lib = g.records;
+                titles = g.titles;
+                lapLog('读取游戏库（GraphQL ' + lib.length + ' 条）');
+            } catch (e) {
+                ui.log('  · GraphQL 不可用（' + ((e && e.message) || e) + '），改用库接口');
+                lib = await fetchLibrary(token);
+                lapLog('读取游戏库（' + lib.length + ' 条）');
+            }
 
-            ui.log('读取权益记录…');
-            ui.progress(22, '读取权益');
+            ui.log('读取权益…');
+            ui.progress(18, '读取权益');
             const ents = await fetchEntitlements(token, accountId);
+            lapLog('读取权益（' + ents.length + ' 条）');
 
             // 按 namespace 归组：同一游戏的多个条目（多平台 / 多 cid）合并为一条
             const groups = new Map();
@@ -337,16 +612,43 @@
             }
 
             const games = [];
-            let done = 0;
             const parseStart = Date.now();
 
-            await pool(list, CONCURRENCY, async function (ns) {
+            // 先把所有 catalogItemId 收齐一次性批量取标题，再组装；不要再在循环里逐条请求
+            const allCids = [];
+            for (const ns of list) {
+                const rows = groups.get(ns);
+                const cid = (rows.find(function (r) { return r.catalogItemId; }) || {}).catalogItemId || null;
+                if (cid) allCids.push(cid);
+            }
+
+            // 标题通常已在读库时随 GraphQL 一并取到（同一个 catalogItem 子树，不额外花时间）。
+            // 只有读库走了 GM 兜底时 titles 才是 null，这时用 GM 目录接口批量补标题。
+            let catalogOut = null;
+            if (!titles) {
+                ui.progress(22, '解析游戏名');
+                catalogOut = await fetchCatalogTitles(token, allCids);
+                titles = catalogOut.titles;
+                lapLog('解析游戏名（' + catalogOut.stats.batches + ' 批）');
+            }
+            if (catalogOut && catalogOut.stats.failedBatches > 0) {
+                // 明确说出来，而不是让用户对着几个代号名猜
+                ui.log('  ⚠ 有 ' + catalogOut.stats.failedBatches + ' / ' + catalogOut.stats.batches
+                    + ' 批目录请求失败，对应游戏回退为沙盒名');
+            }
+
+            for (const ns of list) {
                 const rows = groups.get(ns);
                 const first = rows[0];
+                // 同一个 namespace 下可能有多个 catalogItemId（38 组，典型是主游戏 + DLC/原声/壁纸，
+                // 或者 iOS/Android 两条分平台记录）。这里取组内第一条，是按服务端返回顺序来的。
+                // 实测这个顺序是稳定的：连续两次拉取 532 条，426 个 namespace 里 425 个的首条
+                // catalogItemId 完全一致；唯一的例外是 4ff8a9b4…（《Faily Brakes 2》的 iOS 与 Android
+                // 两条记录，acquisitionDate 只差 43 毫秒），而这两条的标题完全相同，所以导出内容不受影响。
+                // 注：换过「最早获得」「cid 字典序」「标题最短」等确定性规则，都会把主游戏换成
+                // 「HD Wallpaper」「Q.U.B.E. 2 Soundtrack」这类附加内容（8 个游戏会改名），故仍用组内首条。
                 const cid = (rows.find(function (r) { return r.catalogItemId; }) || {}).catalogItemId || null;
-
-                let title = null;
-                if (cid) title = await resolveTitle(token, ns, cid);
+                const title = cid ? (titles.get(cid) || null) : null;
 
                 const dates = rows.map(function (r) { return r.acquisitionDate; })
                     .filter(Boolean).sort();
@@ -367,19 +669,11 @@
                     entitled: entByNs.has(ns),
                     resolved: !!title
                 });
+            }
 
-                done++;
-                // 每个都推一次：426 个任务下若每 10 个才更新，界面会静默两秒以上
-                ui.progress(22 + Math.round(done / list.length * 76),
-                    '解析游戏名 ' + done + '/' + list.length);
-                if (done % 20 === 0 || done === list.length) {
-                    // 速率只算解析阶段本身，不要把取码/读库/读权益的时间摊进来
-                    const sec = (Date.now() - parseStart) / 1000;
-                    ui.log('  已解析 ' + done + '/' + list.length
-                        + '，用时 ' + sec.toFixed(1) + 's'
-                        + (done >= 20 && sec > 0.2 ? '（约 ' + (done / sec).toFixed(1) + ' 个/秒）' : ''));
-                }
-            });
+            const parseSec = (Date.now() - parseStart) / 1000;
+            const resolvedCount = games.filter(function (g) { return g.resolved; }).length;
+            ui.log('  已解析 ' + resolvedCount + '/' + games.length + ' 个标题，用时 ' + parseSec.toFixed(1) + 's');
 
             games.sort(function (a, b) {
                 return String(a.name).localeCompare(String(b.name), 'zh-Hans-CN');
@@ -412,6 +706,9 @@
             stopTicker();
             ui.elapsed(Number(totalSec));
             ui.log('✓ 导出完成：' + games.length + ' 款游戏，共 ' + totalSec + 's');
+            ui.log('  分段：' + stages.map(function (s) {
+                return s.name + ' ' + (s.ms / 1000).toFixed(1) + 's';
+            }).join(' / '));
             enableDownloads(true);
         } catch (err) {
             const msg = (err && err.message) ? err.message : String(err);
@@ -449,36 +746,9 @@
         download(baseName() + '.json', JSON.stringify(state.result, null, 2), 'application/json');
     }
 
-    function csvCell(v) {
-        const s = (v === null || v === undefined) ? '' : String(v);
-        return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-    }
-
-    function exportCsv() {
-        if (!state.result) return;
-        const head = ['gameName', 'platforms', 'acquiredAt', 'namespace',
-            'catalogItemId', 'productId', 'sandboxName', 'inLibraryRecords', 'entitled'];
-        const lines = [head.join(',')];
-        for (const g of state.result.games) {
-            lines.push([
-                g.name,
-                (g.platforms || []).join('|'),
-                g.acquiredAt || '',
-                g.namespace,
-                g.catalogItemId || '',
-                g.productId || '',
-                g.sandboxName || '',
-                g.recordCount,
-                g.entitled ? 'yes' : 'no'
-            ].map(csvCell).join(','));
-        }
-        // BOM 让 Excel 正确识别 UTF-8
-        download(baseName() + '.csv', '\uFEFF' + lines.join('\r\n'), 'text/csv;charset=utf-8');
-    }
-
     // ── 界面 ────────────────────────────────────────────────────────────────
     const ui = (function () {
-        let root, panel, statusEl, elapsedEl, barEl, logEl, btnRun, btnJson, btnCsv;
+        let root, panel, statusEl, elapsedEl, barEl, logEl, btnRun, btnJson;
 
         function inject() {
             root = document.createElement('div');
@@ -510,10 +780,9 @@
                 + 'font-size:13px;font-weight:600;cursor:pointer;margin-bottom:8px}'
                 + '#epic-export-run{background:#0074e4;color:#fff}'
                 + '#epic-export-run:disabled{background:#2a3340;color:#5d6875;cursor:not-allowed}'
-                + '#epic-export-row{display:flex;gap:8px}'
-                + '#epic-export-row button{flex:1;padding:9px;border:1px solid #2f3945;border-radius:7px;'
+                + '#epic-export-json{width:100%;padding:9px;border:1px solid #2f3945;border-radius:7px;'
                 + 'background:#1a212a;color:#cfd6df;font-size:12px;font-weight:600;cursor:pointer}'
-                + '#epic-export-row button:disabled{opacity:.35;cursor:not-allowed}'
+                + '#epic-export-json:disabled{opacity:.35;cursor:not-allowed}'
                 + '</style>'
                 + '<button id="epic-export-fab">Epic 库存导出</button>'
                 + '<div id="epic-export-panel">'
@@ -526,10 +795,7 @@
                 + '  <div id="epic-export-track"><div id="epic-export-bar"></div></div>'
                 + '  <div id="epic-export-log"></div>'
                 + '  <button id="epic-export-run" class="act">开始导出</button>'
-                + '  <div id="epic-export-row">'
-                + '    <button id="epic-export-json" disabled>下载 JSON</button>'
-                + '    <button id="epic-export-csv" disabled>下载 CSV</button>'
-                + '  </div>'
+                + '  <button id="epic-export-json" disabled>下载 JSON</button>'
                 + '</div>';
 
             document.body.appendChild(root);
@@ -541,7 +807,6 @@
             logEl = root.querySelector('#epic-export-log');
             btnRun = root.querySelector('#epic-export-run');
             btnJson = root.querySelector('#epic-export-json');
-            btnCsv = root.querySelector('#epic-export-csv');
 
             root.querySelector('#epic-export-fab').addEventListener('click', function () {
                 panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
@@ -552,7 +817,6 @@
                 runExport().then(function () { btnRun.disabled = false; });
             });
             btnJson.addEventListener('click', exportJson);
-            btnCsv.addEventListener('click', exportCsv);
         }
 
         return {
@@ -571,7 +835,6 @@
             },
             setDownloads: function (on) {
                 if (btnJson) btnJson.disabled = !on;
-                if (btnCsv) btnCsv.disabled = !on;
             }
         };
     })();
