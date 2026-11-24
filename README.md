@@ -94,7 +94,7 @@ Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接
 
 字段说明：
 
-- `name` —— 真实游戏名，按 `zh-CN` 语言从 catalog 解析得到。库里的 `sandboxName` 经常是代号（实测 426 个里有 247 个是 `Live`、20 个是 `* Production`），直接用会得到一堆同名条目。Epic 中文目录会给一部分游戏名套上 `《》`（实测 426 个里有 43 个），脚本会剥掉书名号再写入；若书名号只包住主标题、版本后缀落在外面，剥掉后补一个空格（`《龙腾世纪：审判》年度版` → `龙腾世纪：审判 年度版`）。
+- `name` —— 真实游戏名，按 `en-US` 语言从 catalog 解析得到，因此**一律是英文原名**。库里的 `sandboxName` 经常是代号（实测 426 个里有 247 个是 `Live`、20 个是 `* Production`），直接用会得到一堆同名条目。实测同一批 426 个条目在 `zh-CN` 下有 44 条是中文名、43 条带 `《》`，而 `en-US` 下中文名与书名号均为 0 条，剩下 18 条非 ASCII 字符是英文原名自带的商标符号（`™` `®`）、破折号与 emoji。脚本仍保留剥书名号的兜底逻辑，但按当前目录数据不会触发。
 - `namespace` —— **稳定主键**，同一游戏的多平台 / 多条目共享它。跨设备、跨脚本对账请用它。
 - `platforms` —— 该游戏入库到的平台集合，取值 `Windows` / `Win32` / `Mac` / `Android` / `iOS`。
 - `acquiredAt` —— 最早一次入库时间（ISO 8601，UTC）。
@@ -110,9 +110,9 @@ Epic 有一大批游戏是通过**促销、捆绑包、Prime、兑换码**直接
 2. **换令牌** —— `POST account-public-service-prod03…/account/api/oauth/token`，`grant_type=authorization_code` + `token_type=eg1`，Basic 认证用公开的 EGS 启动器客户端凭据（与 legendary 等项目同一组，非私人密钥）。**授权码一次性，每次导出都重新取。**
 3. **读库存** —— 走**商城同源 GraphQL** `POST https://store.epicgames.com/graphql`，一次请求带 12 个 `libraryItems(cursor:…)` 分页别名（`cursor` 就是 base64 的 `{"offset":N}`，`"MA=="` = 0），直接拿到全部 532 条库记录连同标题和平台。`libraryItems` 只接受 `cursor`，`limit`/`count`/`offset` 全是 Unknown argument；越界页返回空数组，所以多带几个别名不增加成本。实测一次 2.0~2.5 秒。
 
-    **`platforms` 的来源**：`LibraryItem` 自身没有 platform 字段，但 `catalogItem(locale: "zh-CN") { title releaseInfo { platform } }` 里的 `releaseInfo[].platform` 就是平台数组，与 REST 库记录的 `platform` **逐条一致**（532 条 `namespace|cid|排序后平台` 的 SHA256，两侧同为 `d5f9f5cc…12df1`；426 个 namespace 的平台并集摘要两侧同为 `840b0126…19e0`）。这正是以前必须留在 REST 的原因，现已解决。
+    **`platforms` 的来源**：`LibraryItem` 自身没有 platform 字段，但 `catalogItem(locale: "en-US") { title releaseInfo { platform } }` 里的 `releaseInfo[].platform` 就是平台数组，与 REST 库记录的 `platform` **逐条一致**（532 条 `namespace|cid|排序后平台` 的 SHA256，两侧同为 `d5f9f5cc…12df1`；426 个 namespace 的平台并集摘要两侧同为 `840b0126…19e0`）。这正是以前必须留在 REST 的原因，现已解决。
 
-    **locale 必须写在子字段上**：`libraryItems` 不接受 `locale` 参数，要写成 `catalogItem(locale: "zh-CN")`，否则中文游戏名会退回英文（实测全量 515 个条目里有 104 个受影响）。
+    **locale 必须写在子字段上**：`libraryItems` 不接受 `locale` 参数，要写成 `catalogItem(locale: "en-US")`，不写会退回服务端默认语言。
 
     这一段失败时自动退回旧的 REST 路径，见下方「兜底路径」。
 

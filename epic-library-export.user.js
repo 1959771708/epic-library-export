@@ -2,7 +2,7 @@
 // @name         Epic 库存导出
 // @name:en      Epic Library Export
 // @namespace    https://github.com/1959771708/epic-library-export
-// @version      1.3.2
+// @version      1.4.0
 // @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
@@ -412,10 +412,15 @@
     //   实测 532 条里多 releaseInfo 的条目为 0，故取首项与取并集结果一致。
     //
     // locale 必须写在子字段上：libraryItems 不接受 locale 参数（Unknown argument），
-    // 只有 catalogItem(locale: "zh-CN") 有效。实测不带时中文名会退回英文
-    // （阿尔比恩Online → Albion Online，全量 515 条里有 104 条含非 ASCII 字符）；
-    // 带上之后与 GM 目录接口（locale=zh-CN）取到的标题逐字一致，
-    // 515 条 "cid|title" 的 SHA256 两侧同为 b13d8a2f…67ad7。
+    // 只有 catalogItem(locale: "en-US") 有效。
+    //
+    // 用 en-US 而不是 zh-CN，是为了让导出的 name 全是英文原名。实测同一批 426 个
+    // catalogItemId 在两个 locale 下的标题：
+    //   zh-CN：含汉字 44 条、含书名号 43 条、含非 ASCII 93 条
+    //   en-US：含汉字 0 条、含书名号 0 条、含非 ASCII 18 条
+    // en-US 剩下的非 ASCII 都是英文原名自带的商标符号与破折号
+    // （™ ×15、® ×4、– ×2、’ ×1、🍜 ×1），去不掉也不该去。
+    // 两个 locale 标题相同 346 条、不同 80 条，无仅单侧存在的条目。
     async function fetchLibraryGraphql() {
         const PAGES = 12;
         const STEP = 100;
@@ -425,7 +430,7 @@
             aliases.push('p' + i + ': libraryItems(cursor: "' + btoa(String(i * STEP)) + '")'
                 + ' { records { namespace catalogItemId productId appName sandboxName sandboxType'
                 + ' acquisitionDate recordType'
-                + ' catalogItem(locale: "zh-CN") { title releaseInfo { platform } } } }');
+                + ' catalogItem(locale: "en-US") { title releaseInfo { platform } } } }');
         }
         const query = 'query Q { Library { ' + aliases.join(' ') + ' } }';
 
@@ -503,7 +508,7 @@
             await pool(wave, CATALOG_WAVE, async function (chunk) {
                 const q = chunk.map(function (id) { return 'id=' + encodeURIComponent(id); }).join('&');
                 const url = CATALOG_HOST + '/catalog/api/shared/bulk/items?' + q
-                    + '&country=US&locale=zh-CN';
+                    + '&country=US&locale=en-US';
 
                 let j = null;
                 try {
@@ -693,7 +698,7 @@
             ui.log('  已解析 ' + resolvedCount + '/' + games.length + ' 个标题，用时 ' + parseSec.toFixed(1) + 's');
 
             games.sort(function (a, b) {
-                return String(a.name).localeCompare(String(b.name), 'zh-Hans-CN');
+                return String(a.name).localeCompare(String(b.name), 'en-US');
             });
 
             const stamps = games.map(function (g) { return g.acquiredAt; })
