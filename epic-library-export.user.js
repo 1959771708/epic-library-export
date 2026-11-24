@@ -2,7 +2,7 @@
 // @name         Epic 库存导出
 // @name:en      Epic Library Export
 // @namespace    https://github.com/1959771708/epic-library-export
-// @version      1.3.1
+// @version      1.3.2
 // @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
@@ -122,6 +122,23 @@
     function parseJson(text, what) {
         try { return JSON.parse(text); }
         catch (e) { throw new Error(what + ' 返回非 JSON（可能被反爬拦截，请刷新页面重试）'); }
+    }
+
+    // 剥掉目录标题里的书名号。Epic 中文目录会给一部分游戏名套上《》（实测 426 款里 43 条），
+    // 这是服务端返回的原文，不是脚本加的；原样写进 JSON 会让按名字对账的第三方工具多一层噪音。
+    // 不含书名号的标题原样返回，一个字都不动。
+    function stripBookTitle(value) {
+        if (typeof value !== 'string') return value;
+        if (value.indexOf('\u300A') === -1 && value.indexOf('\u300B') === -1) return value;
+
+        // 1) 书名号整对从开头包住主标题、版本后缀落在外面时，补一个空格（《X》年度版 → X 年度版）。
+        //    否则会黏成「X年度版」，与「art of rally Standard Edition」风格不一致。
+        // 2) 其余情况（行内书名号、只有半边）只删字符不补空格，避免插出「左中 右」。
+        // 两边都保留一个兜底：剥完变空就用只删不补的结果，再空就退回原文。
+        const spaced = value.replace(/\u300B/g, ' ').replace(/\u300A/g, ' ').replace(/\s+/g, ' ').trim();
+        const bare = value.replace(/[\u300A\u300B]/g, '').replace(/\s+/g, ' ').trim();
+        const looksWrapped = /^\s*\u300A/.test(value);
+        return (looksWrapped ? spaced : bare) || bare || value;
     }
 
     // ── Epic 接口 ───────────────────────────────────────────────────────────
@@ -658,7 +675,7 @@
                 }
 
                 games.push({
-                    name: title || first.sandboxName || ns,
+                    name: stripBookTitle(title) || first.sandboxName || ns,
                     namespace: ns,
                     catalogItemId: cid,
                     productId: first.productId || null,
