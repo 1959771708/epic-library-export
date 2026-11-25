@@ -2,7 +2,7 @@
 // @name         Epic 库存导出
 // @name:en      Epic Library Export
 // @namespace    https://github.com/1959771708/epic-library-export
-// @version      1.4.0
+// @version      1.5.0
 // @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
@@ -61,28 +61,47 @@
         return String(u).replace(/^https?:\/\//, '').slice(0, 60);
     }
 
+    // 只有「数字且在 2xx」才算成功。这里必须显式判断 typeof：
+    // 残缺的脚本管理器（部分浏览器自带的「油猴」实现）会立刻回一个没有 status 字段的
+    // 响应对象，而 `undefined < 200` 与 `undefined >= 300` 同时为 false，旧写法会放行，
+    // 最终报成「返回非 JSON（可能被反爬拦截）」——把用户引到反爬这个错误方向上排查。
+    function okStatus(st) {
+        return typeof st === 'number' && st >= 200 && st < 300;
+    }
+
+    function httpFailure(res, url) {
+        const st = res && res.status;
+        if (typeof st === 'number') {
+            const err = new Error('HTTP ' + st + ' · ' + shortUrl(url));
+            err.status = st;
+            return err;
+        }
+        // 环境性失败：同一次点击里连发几次结果完全相同，重试只是白等，故标记为不可重试
+        const err = new Error('没拿到 HTTP 响应（响应对象里没有 status）· ' + shortUrl(url)
+            + ' · 脚本管理器可能不是完整版 Tampermonkey，点面板里的「环境自检」看详情');
+        err.status = undefined;
+        err.envProblem = true;
+        return err;
+    }
+
     // 单次请求（不带重试）
     function httpOnce(cfg, url) {
         if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
             return GM.xmlHttpRequest(cfg).then(function (res) {
-                if (!res || res.status < 200 || res.status >= 300) {
-                    const err = new Error('HTTP ' + (res && res.status) + ' · ' + shortUrl(url));
-                    err.status = res && res.status;
-                    throw err;
-                }
+                if (!okStatus(res && res.status)) throw httpFailure(res, url);
                 return res.responseText;
             });
         }
         if (typeof GM_xmlhttpRequest !== 'function') {
-            throw new Error('未检测到 GM_xmlhttpRequest，请确认脚本由 Tampermonkey 运行');
+            const err = new Error('未检测到 GM_xmlhttpRequest，请确认脚本由 Tampermonkey 运行');
+            err.envProblem = true;   // 同样是环境问题，重试无意义
+            throw err;
         }
         return new Promise(function (resolve, reject) {
             GM_xmlhttpRequest(Object.assign({}, cfg, {
                 onload: function (r) {
-                    if (r.status >= 200 && r.status < 300) return resolve(r.responseText);
-                    const err = new Error('HTTP ' + r.status + ' · ' + shortUrl(url));
-                    err.status = r.status;
-                    reject(err);
+                    if (okStatus(r.status)) return resolve(r.responseText);
+                    reject(httpFailure(r, url));
                 },
                 onerror: function () { reject(new Error('网络错误 · ' + shortUrl(url))); },
                 ontimeout: function () { reject(new Error('请求超时 · ' + shortUrl(url))); }
@@ -108,8 +127,10 @@
             } catch (e) {
                 lastErr = e;
                 const st = e && e.status;
-                const retryable = st === 429 || st === 500 || st === 502 ||
-                    st === 503 || st === 504 || st === undefined;
+                // envProblem（响应对象里根本没有 status）是脚本管理器能力问题，不是网络抖动：
+                // 同一环境下每次结果完全一样，重试只会让用户多等 900ms 左右，直接抛出。
+                const retryable = !(e && e.envProblem) && (st === 429 || st === 500 || st === 502 ||
+                    st === 503 || st === 504 || st === undefined);
                 if (attempt === RETRIES || !retryable) break;
                 // 429 稍等更久，其余 300ms / 600ms
                 const backoff = (st === 429 ? 1200 : 300) * Math.pow(2, attempt);
@@ -737,6 +758,11 @@
             stopTicker();
             ui.log('✗ 失败：' + msg);
             ui.progress(0, '失败');
+            // 环境性失败（响应里没有 status）不是重试能解决的，直接把判据摊开给用户看。
+            // 手机上没有控制台，这段日志就是唯一的取证途径。
+            if (err && err.envProblem) {
+                runEnvCheck().catch(function () { });
+            }
         } finally {
             state.running = false;
             stopTicker();
@@ -766,6 +792,106 @@
     function exportJson() {
         if (!state.result) return;
         download(baseName() + '.json', JSON.stringify(state.result, null, 2), 'application/json');
+    }
+
+    // ── 环境自检 ────────────────────────────────────────────────────────────
+    // 报错「HTTP undefined」时，唯一能把问题钉死在脚本管理器上的证据是「它到底给了
+    // 我们什么」。所以自检不做判断，只把原始事实逐条打出来：管理器标识、GM4 / GM_
+    // 两套 API 在不在、以及一次真实请求返回对象的字段清单。手机上看不到控制台，
+    // 这些信息必须落在面板里。
+    function envFacts() {
+        const facts = [];
+        let gm = null, info = null;
+        try { if (typeof GM !== 'undefined' && GM) gm = GM; } catch (e) { /* 部分管理器访问即抛 */ }
+        try { if (typeof GM_info !== 'undefined' && GM_info) info = GM_info; } catch (e) { }
+        if (!info && gm && gm.info) info = gm.info;
+
+        const handler = info && (info.scriptHandler || (info.script && info.script.name));
+        const ver = info && info.version;
+        facts.push('管理器：' + (handler
+            ? handler + (ver ? ' ' + ver : '')
+            : '读不到 GM_info（正常 Tampermonkey 会提供）'));
+        facts.push('GM.xmlHttpRequest（GM4）：'
+            + (gm && typeof gm.xmlHttpRequest === 'function' ? '可用' : '不可用'));
+        facts.push('GM_xmlhttpRequest（旧版）：'
+            + (typeof GM_xmlhttpRequest === 'function' ? '可用' : '不可用'));
+        return facts;
+    }
+
+    // 探测一次真实请求。刻意不走 httpOnce：这里要看的就是原始响应对象本身，
+    // 哪怕 status 缺失也要把对象交出来，而不是提前变成一句错误文案。
+    function probeOnce(url) {
+        return new Promise(function (resolve) {
+            const cfg = { method: 'GET', url: url, timeout: 15000 };
+            let hasGm4 = false;
+            try { hasGm4 = typeof GM !== 'undefined' && !!GM && typeof GM.xmlHttpRequest === 'function'; }
+            catch (e) { }
+
+            if (hasGm4) {
+                try {
+                    GM.xmlHttpRequest(cfg).then(
+                        function (res) { resolve({ raw: res, via: 'GM4' }); },
+                        function (e) { resolve({ raw: e, via: 'GM4 被拒绝' }); });
+                } catch (e) { resolve({ raw: e, via: 'GM4 同步抛错' }); }
+                return;
+            }
+            if (typeof GM_xmlhttpRequest === 'function') {
+                try {
+                    GM_xmlhttpRequest(Object.assign({}, cfg, {
+                        onload: function (r) { resolve({ raw: r, via: 'GM_xmlhttpRequest' }); },
+                        onerror: function (r) { resolve({ raw: r, via: 'GM_xmlhttpRequest onerror' }); },
+                        ontimeout: function (r) { resolve({ raw: r, via: 'GM_xmlhttpRequest ontimeout' }); }
+                    }));
+                } catch (e) { resolve({ raw: e, via: 'GM_xmlhttpRequest 同步抛错' }); }
+                return;
+            }
+            resolve({ raw: new Error('两套 GM 接口都不存在'), via: '无接口' });
+        });
+    }
+
+    function describeRaw(raw) {
+        if (raw instanceof Error) return '请求被拒绝：' + raw.message;
+        if (raw === null || typeof raw !== 'object') return '响应对象：' + String(raw);
+
+        const keys = Object.keys(raw);
+        const out = ['响应对象字段：' + (keys.length ? keys.join(', ') : '(空)')];
+        if ('status' in raw) {
+            out.push('status = ' + JSON.stringify(raw.status) + '（类型 ' + typeof raw.status + '）');
+        } else {
+            out.push('status 字段不存在 ← 「HTTP undefined」就是这么来的');
+        }
+        if (typeof raw.responseText === 'string') out.push('responseText 长度 ' + raw.responseText.length);
+        if (raw.statusText) out.push('statusText = ' + String(raw.statusText));
+        if (raw.error) out.push('error = ' + String(raw.error));
+        return out.join('\n    ');
+    }
+
+    async function runEnvCheck() {
+        ui.progress(0, '环境自检中');
+        ui.log('── 环境自检 ──');
+        envFacts().forEach(function (f) { ui.log('    ' + f); });
+
+        const url = 'https://www.epicgames.com/id/api/redirect'
+            + '?clientId=' + CLIENT_ID + '&responseType=code';
+        const got = await probeOnce(url);
+        ui.log('    探测 ' + shortUrl(url) + '（经 ' + got.via + '）');
+        ui.log('    ' + describeRaw(got.raw));
+
+        // 三种结论必须分开，否则会把「Epic 返回错误码」误报成「管理器有问题」：
+        // 拿到数字 status 就说明请求链路本身是通的，非 2xx 是 Epic 那边的答复。
+        const st = got.raw && got.raw.status;
+        let ok = false;
+        if (typeof st !== 'number') {
+            ui.log('✗ 环境异常：上面的响应对象就是失败原因，与 Epic 账号和登录状态无关');
+        } else if (st >= 200 && st < 300) {
+            ok = true;
+            ui.log('✓ 环境可用：拿到了数字 status，请求链路正常');
+        } else {
+            ui.log('⚠ 请求链路正常（拿到了数字 status），但 Epic 返回了 ' + st
+                + '，这是服务端答复，不是脚本管理器的问题');
+        }
+        ui.progress(0, ok ? '自检通过' : '自检未通过');
+        return ok;
     }
 
     // ── 界面 ────────────────────────────────────────────────────────────────
@@ -805,6 +931,10 @@
                 + '#epic-export-json{width:100%;padding:9px;border:1px solid #2f3945;border-radius:7px;'
                 + 'background:#1a212a;color:#cfd6df;font-size:12px;font-weight:600;cursor:pointer}'
                 + '#epic-export-json:disabled{opacity:.35;cursor:not-allowed}'
+                + '#epic-export-diag{width:100%;padding:7px;border:1px solid #2f3945;border-radius:7px;'
+                + 'background:transparent;color:#8b96a3;font-size:11px;font-weight:600;cursor:pointer;'
+                + 'margin-top:8px}'
+                + '#epic-export-diag:hover{color:#cfd6df;border-color:#3d4a58}'
                 + '</style>'
                 + '<button id="epic-export-fab">Epic 库存导出</button>'
                 + '<div id="epic-export-panel">'
@@ -818,6 +948,7 @@
                 + '  <div id="epic-export-log"></div>'
                 + '  <button id="epic-export-run" class="act">开始导出</button>'
                 + '  <button id="epic-export-json" disabled>下载 JSON</button>'
+                + '  <button id="epic-export-diag">环境自检</button>'
                 + '</div>';
 
             document.body.appendChild(root);
@@ -829,6 +960,7 @@
             logEl = root.querySelector('#epic-export-log');
             btnRun = root.querySelector('#epic-export-run');
             btnJson = root.querySelector('#epic-export-json');
+            const btnDiag = root.querySelector('#epic-export-diag');
 
             root.querySelector('#epic-export-fab').addEventListener('click', function () {
                 panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
@@ -839,6 +971,12 @@
                 runExport().then(function () { btnRun.disabled = false; });
             });
             btnJson.addEventListener('click', exportJson);
+            btnDiag.addEventListener('click', function () {
+                if (state.running) return;
+                btnDiag.disabled = true;
+                runEnvCheck().then(function () { btnDiag.disabled = false; },
+                    function () { btnDiag.disabled = false; });
+            });
         }
 
         return {
@@ -887,6 +1025,16 @@
         ui.mount();
         ui.progress(0, '就绪');
         ui.log('已就绪。确认已登录 Epic 后点「开始导出」。');
+
+        // 启动时只报静态事实，不发请求（探测留给「环境自检」按钮，避免每次刷新都打一次 Epic）。
+        // 缺 GM4 的环境必然走到旧回调分支，提前说清楚，省得用户导出失败后再回来问。
+        let hasGm4 = false;
+        try { hasGm4 = typeof GM !== 'undefined' && !!GM && typeof GM.xmlHttpRequest === 'function'; }
+        catch (e) { }
+        if (!hasGm4) {
+            ui.log('⚠ 当前脚本管理器没有 GM.xmlHttpRequest（GM4），'
+                + '导出很可能失败。建议换完整版 Tampermonkey，或点「环境自检」查看详情。');
+        }
     }
 
     if (document.readyState === 'loading') {
