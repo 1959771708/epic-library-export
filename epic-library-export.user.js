@@ -2,7 +2,7 @@
 // @name         Epic 库存导出
 // @name:en      Epic Library Export
 // @namespace    https://github.com/1959771708/epic-library-export
-// @version      1.5.0
+// @version      1.5.1
 // @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
@@ -78,35 +78,134 @@
         }
         // 环境性失败：同一次点击里连发几次结果完全相同，重试只是白等，故标记为不可重试
         const err = new Error('没拿到 HTTP 响应（响应对象里没有 status）· ' + shortUrl(url)
-            + ' · 脚本管理器可能不是完整版 Tampermonkey，点面板里的「环境自检」看详情');
+            + ' · 两条 GM 通道都拿不到响应，点面板里的「环境自检」看详情');
         err.status = undefined;
         err.envProblem = true;
         return err;
     }
 
-    // 单次请求（不带重试）
-    function httpOnce(cfg, url) {
-        if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
-            return GM.xmlHttpRequest(cfg).then(function (res) {
-                if (!okStatus(res && res.status)) throw httpFailure(res, url);
-                return res.responseText;
-            });
-        }
-        if (typeof GM_xmlhttpRequest !== 'function') {
-            const err = new Error('未检测到 GM_xmlhttpRequest，请确认脚本由 Tampermonkey 运行');
-            err.envProblem = true;   // 同样是环境问题，重试无意义
-            throw err;
-        }
+    // GM4 是否「真的」能用。XMonkey 1.2.7 实测：GM.xmlHttpRequest 是函数、调用也不抛，
+    // 但返回的 Promise 解出来是 undefined —— 存在不等于可用，只能靠一次真实请求证明。
+    // 探测失败后记在这里，后续请求直接走旧版接口，不再每次白试一遍。
+    let gm4Broken = false;
+
+    function hasGm4() {
+        try {
+            return typeof GM !== 'undefined' && !!GM && typeof GM.xmlHttpRequest === 'function';
+        } catch (e) { return false; }
+    }
+
+    function hasLegacy() {
+        return typeof GM_xmlhttpRequest === 'function';
+    }
+
+    // 网络层失败：请求发出去了但没拿到响应。这类错误不标 envProblem ——
+    // 换通道重打会走同一条网络，重试本身交给 httpText 判断。
+    function networkError(what, url) {
+        const err = new Error(what + ' · ' + shortUrl(url));
+        err.status = undefined;
+        return err;
+    }
+
+    // GM4 名义上回 Promise，但不是所有管理器都真实现了 Promise 通道：
+    // XMonkey 1.2.7 实测就是「函数在、调用不抛、Promise 解出来是 undefined」。
+    // 所以这里同时挂回调和等 Promise，谁先拿到真响应就用谁 —— 少赌一种实现方式。
+    function gm4Request(cfg, url) {
+        return new Promise(function (resolve, reject) {
+            let settled = false;
+            let graceTimer = null;
+            let finalTimer = null;
+
+            function clearTimers() {
+                if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+                if (finalTimer) { clearTimeout(finalTimer); finalTimer = null; }
+            }
+            function finish(fn, v) {
+                if (settled) return;
+                settled = true;
+                clearTimers();
+                fn(v);
+            }
+            function settle(r) {
+                if (!okStatus(r && r.status)) return finish(reject, httpFailure(r, url));
+                finish(resolve, r.responseText);
+            }
+
+            const timeoutMs = cfg.timeout || 15000;
+            // 最后一道保险：不管管理器怎么实现，都不让 Promise 永远悬着。
+            finalTimer = setTimeout(function () {
+                finish(reject, networkError('请求超时', url));
+            }, timeoutMs + 1000);
+
+            let p;
+            try {
+                p = GM.xmlHttpRequest(Object.assign({}, cfg, {
+                    onload: function (r) { settle(r); },
+                    onerror: function () { finish(reject, networkError('网络错误', url)); },
+                    ontimeout: function () { finish(reject, networkError('请求超时', url)); }
+                }));
+            } catch (e) {
+                finish(reject, e);
+                return;
+            }
+
+            if (p && typeof p.then === 'function') {
+                p.then(function (r) {
+                    if (okStatus(r && r.status)) return finish(resolve, r.responseText);
+                    if (settled) return;
+                    // Promise 解出一个没有 status 的东西（XMonkey 就是这个行为）。
+                    // 注意这里不能等太久：Promise 已经 resolve，说明管理器认为请求结束了，
+                    // 它不会在若干秒后再补一个响应。给个短宽限只是防「先 resolve、回调紧随其后」
+                    // 的实现顺序，等不到就是真没拿到响应 —— 判成环境问题，好让上层换通道。
+                    // （GM 链路 6~7s 的固定开销发生在 resolve 之前，由下面的 finalTimer 兜底。）
+                    graceTimer = setTimeout(function () { settle(r); }, 500);
+                }, function (e) { finish(reject, e); });
+            }
+        });
+    }
+
+    function legacyRequest(cfg, url) {
         return new Promise(function (resolve, reject) {
             GM_xmlhttpRequest(Object.assign({}, cfg, {
                 onload: function (r) {
                     if (okStatus(r.status)) return resolve(r.responseText);
                     reject(httpFailure(r, url));
                 },
-                onerror: function () { reject(new Error('网络错误 · ' + shortUrl(url))); },
-                ontimeout: function () { reject(new Error('请求超时 · ' + shortUrl(url))); }
+                onerror: function () { reject(networkError('网络错误', url)); },
+                ontimeout: function () { reject(networkError('请求超时', url)); }
             }));
         });
+    }
+
+    // 单次请求（不带重试）
+    function httpOnce(cfg, url) {
+        const canGm4 = hasGm4() && !gm4Broken;
+        const canLegacy = hasLegacy();
+
+        if (canGm4) {
+            let p;
+            try {
+                p = gm4Request(cfg, url);
+            } catch (e) {
+                // 调用即抛（同步失败）：有旧版接口就走兜底，否则原样抛
+                if (!canLegacy) throw e;
+                p = Promise.reject(e);
+            }
+            if (!canLegacy) return p;
+            return p.catch(function (e) {
+                // 只有「一个 status 都没拿到」才换通道。真实状态码（401/500…）是服务端答复，
+                // 换接口重打只会重复请求，不该发生。
+                if (!(e && e.envProblem)) throw e;
+                gm4Broken = true;   // 记住：这台机器的 GM4 不能用
+                return legacyRequest(cfg, url);
+            });
+        }
+
+        if (canLegacy) return legacyRequest(cfg, url);
+
+        const err = new Error('未检测到 GM_xmlhttpRequest，请确认脚本由 Tampermonkey 运行');
+        err.envProblem = true;   // 同样是环境问题，重试无意义
+        throw err;
     }
 
     function sleep(ms) {
@@ -820,32 +919,49 @@
 
     // 探测一次真实请求。刻意不走 httpOnce：这里要看的就是原始响应对象本身，
     // 哪怕 status 缺失也要把对象交出来，而不是提前变成一句错误文案。
-    function probeOnce(url) {
+    // channel 决定走哪条既定的通道（'GM4' / 'GM_xmlhttpRequest'）。
+    function probeOnce(url, channel) {
         return new Promise(function (resolve) {
             const cfg = { method: 'GET', url: url, timeout: 15000 };
-            let hasGm4 = false;
-            try { hasGm4 = typeof GM !== 'undefined' && !!GM && typeof GM.xmlHttpRequest === 'function'; }
-            catch (e) { }
+            let done = false;
+            function give(raw, via) {
+                if (done) return;
+                done = true;
+                resolve({ raw: raw, via: via });
+            }
 
-            if (hasGm4) {
+            if (channel === 'GM4') {
+                let p;
+                // 必须和 httpOnce 里的 gm4Request 保持同一种调用形态：回调与 Promise 都挂。
+                // 只等 Promise 会把「回调式实现」误报成坏通道，自检结论就和实际导出打架了。
                 try {
-                    GM.xmlHttpRequest(cfg).then(
-                        function (res) { resolve({ raw: res, via: 'GM4' }); },
-                        function (e) { resolve({ raw: e, via: 'GM4 被拒绝' }); });
-                } catch (e) { resolve({ raw: e, via: 'GM4 同步抛错' }); }
-                return;
-            }
-            if (typeof GM_xmlhttpRequest === 'function') {
-                try {
-                    GM_xmlhttpRequest(Object.assign({}, cfg, {
-                        onload: function (r) { resolve({ raw: r, via: 'GM_xmlhttpRequest' }); },
-                        onerror: function (r) { resolve({ raw: r, via: 'GM_xmlhttpRequest onerror' }); },
-                        ontimeout: function (r) { resolve({ raw: r, via: 'GM_xmlhttpRequest ontimeout' }); }
+                    p = GM.xmlHttpRequest(Object.assign({}, cfg, {
+                        onload: function (r) { give(r, 'GM4 onload'); },
+                        onerror: function (r) { give(r, 'GM4 onerror'); },
+                        ontimeout: function (r) { give(r, 'GM4 ontimeout'); }
                     }));
-                } catch (e) { resolve({ raw: e, via: 'GM_xmlhttpRequest 同步抛错' }); }
+                } catch (e) { give(e, 'GM4 同步抛错'); return; }
+
+                if (p && typeof p.then === 'function') {
+                    p.then(
+                        function (res) { give(res, 'GM4'); },
+                        function (e) { give(e, 'GM4 被拒绝'); });
+                } else {
+                    // 没回 Promise、回调也还没来：等一小会儿再下结论，别把回调式实现判死
+                    setTimeout(function () {
+                        give(p, p === undefined ? 'GM4 无返回（回调也没来）' : 'GM4 返回了非 Promise');
+                    }, 1200);
+                }
                 return;
             }
-            resolve({ raw: new Error('两套 GM 接口都不存在'), via: '无接口' });
+
+            try {
+                GM_xmlhttpRequest(Object.assign({}, cfg, {
+                    onload: function (r) { give(r, 'GM_xmlhttpRequest'); },
+                    onerror: function (r) { give(r, 'GM_xmlhttpRequest onerror'); },
+                    ontimeout: function (r) { give(r, 'GM_xmlhttpRequest ontimeout'); }
+                }));
+            } catch (e) { give(e, 'GM_xmlhttpRequest 同步抛错'); }
         });
     }
 
@@ -873,22 +989,53 @@
 
         const url = 'https://www.epicgames.com/id/api/redirect'
             + '?clientId=' + CLIENT_ID + '&responseType=code';
-        const got = await probeOnce(url);
-        ui.log('    探测 ' + shortUrl(url) + '（经 ' + got.via + '）');
-        ui.log('    ' + describeRaw(got.raw));
 
-        // 三种结论必须分开，否则会把「Epic 返回错误码」误报成「管理器有问题」：
-        // 拿到数字 status 就说明请求链路本身是通的，非 2xx 是 Epic 那边的答复。
-        const st = got.raw && got.raw.status;
+        // 两条通道各打一次：这台机器上哪条真能用，只有实测说了算。
+        // 存在 + 不报错 都不等于能用（XMonkey 1.2.7 的 GM4 就是函数在、Promise 解出来是 undefined）。
+        const results = [];
+        if (hasGm4()) {
+            const got = await probeOnce(url, 'GM4');
+            results.push({ name: 'GM4', got: got });
+            ui.log('    探测 ' + shortUrl(url) + '（经 ' + got.via + '）');
+            ui.log('    ' + describeRaw(got.raw));
+        }
+        if (hasLegacy()) {
+            const got = await probeOnce(url, 'GM_xmlhttpRequest');
+            results.push({ name: '旧版', got: got });
+            ui.log('    探测 ' + shortUrl(url) + '（经 ' + got.via + '）');
+            ui.log('    ' + describeRaw(got.raw));
+        }
+
+        function statusOf(r) {
+            const st = r.got && r.got.raw && r.got.raw.status;
+            return typeof st === 'number' ? st : null;
+        }
+        const usable = results.filter(function (r) { return statusOf(r) !== null; });
+
+        // 结论要说到「能不能导出」这个用户真正关心的问题上，而不是停在技术描述。
         let ok = false;
-        if (typeof st !== 'number') {
-            ui.log('✗ 环境异常：上面的响应对象就是失败原因，与 Epic 账号和登录状态无关');
-        } else if (st >= 200 && st < 300) {
-            ok = true;
-            ui.log('✓ 环境可用：拿到了数字 status，请求链路正常');
+        if (!usable.length) {
+            gm4Broken = hasGm4();
+            ui.log('✗ 两条 GM 通道都没拿到 HTTP 响应，导出无法进行。上面的响应对象就是失败原因，与 Epic 账号和登录状态无关。');
         } else {
-            ui.log('⚠ 请求链路正常（拿到了数字 status），但 Epic 返回了 ' + st
-                + '，这是服务端答复，不是脚本管理器的问题');
+            const best = usable[0];
+            const st = statusOf(best);
+            const nameOf = function (n) { return n === 'GM4' ? 'GM.xmlHttpRequest（GM4）' : 'GM_xmlhttpRequest（旧版）'; };
+            // 能拿到数字 status 就说明这条链路是通的；非 2xx 是 Epic 那边的答复。
+            if (st >= 200 && st < 300) ok = true;
+
+            const gm4Failed = results.some(function (r) { return r.name === 'GM4' && statusOf(r) === null; });
+            if (gm4Failed) gm4Broken = true;   // 与网络层的自动降级保持一致
+
+            if (gm4Failed && st >= 200 && st < 300) {
+                ui.log('⚠ 这个管理器的 GM.xmlHttpRequest（GM4）拿不到响应，但旧版 GM_xmlhttpRequest 正常。'
+                    + '脚本已自动改用旧版通道，可以直接点「开始导出」，功能不受影响。');
+            } else if (st >= 200 && st < 300) {
+                ui.log('✓ 环境可用：' + nameOf(best.name) + ' 拿到了数字 status，请求链路正常。');
+            } else {
+                ui.log('⚠ 请求链路是通的（' + nameOf(best.name) + ' 拿到了数字 status），'
+                    + '但 Epic 返回了 ' + st + '，这是服务端答复，不是脚本管理器的问题。');
+            }
         }
         ui.progress(0, ok ? '自检通过' : '自检未通过');
         return ok;
@@ -1020,6 +1167,23 @@
     }
 
     // ── 启动 ────────────────────────────────────────────────────────────────
+    // 供自测台（tools/selftest.cjs，vm 沙箱）调用内部函数。只读句柄，不改行为：
+    // 生产环境里没人会读这个对象，沙箱里靠它绕开界面直接验网络层与自检结论。
+    window.__epicExport = {
+        okStatus: okStatus,
+        httpFailure: httpFailure,
+        networkError: networkError,
+        hasGm4: hasGm4,
+        hasLegacy: hasLegacy,
+        gm4Broken: function () { return gm4Broken; },
+        setGm4Broken: function (v) { gm4Broken = !!v; },
+        httpOnce: httpOnce,
+        probeOnce: probeOnce,
+        describeRaw: describeRaw,
+        runEnvCheck: runEnvCheck,
+        shortUrl: shortUrl
+    };
+
     function boot() {
         if (document.getElementById('epic-export-root')) return;
         ui.mount();
@@ -1027,13 +1191,11 @@
         ui.log('已就绪。确认已登录 Epic 后点「开始导出」。');
 
         // 启动时只报静态事实，不发请求（探测留给「环境自检」按钮，避免每次刷新都打一次 Epic）。
-        // 缺 GM4 的环境必然走到旧回调分支，提前说清楚，省得用户导出失败后再回来问。
-        let hasGm4 = false;
-        try { hasGm4 = typeof GM !== 'undefined' && !!GM && typeof GM.xmlHttpRequest === 'function'; }
-        catch (e) { }
-        if (!hasGm4) {
-            ui.log('⚠ 当前脚本管理器没有 GM.xmlHttpRequest（GM4），'
-                + '导出很可能失败。建议换完整版 Tampermonkey，或点「环境自检」查看详情。');
+        // 注意不能把「没有 GM4」当成问题：旧版 GM_xmlhttpRequest 同样能用，
+        // 真正会失败的是两套接口都没有的环境（例如脚本管理器整个没生效）。
+        if (!hasGm4() && !hasLegacy()) {
+            ui.log('⚠ 没检测到任何 GM 请求接口，导出无法进行。'
+                + '请确认脚本由 Tampermonkey 等脚本管理器运行，或点「环境自检」查看详情。');
         }
     }
 
