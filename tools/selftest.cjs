@@ -481,6 +481,43 @@ async function testEnvCheck() {
         assert(log.indexOf('环境可用') >= 0, '应报环境可用，实际：\n' + log);
         assert(log.indexOf('已自动改用旧版通道') < 0, '不该误报降级');
     });
+
+    // 15. XMonkey 1.2.7 实测 onerror 带 status = -1：绝不能误判成「Epic 服务端返回了 -1」
+    await checkAsync('自检：onerror 带 status=-1 判为网络错误而非服务端答复', async function () {
+        const dom = makeDom();
+        const sandbox = {
+            console: console, setTimeout: setTimeout, clearTimeout: clearTimeout,
+            setInterval: setInterval, clearInterval: clearInterval,
+            Date: Date, JSON: JSON, Math: Math, Promise: Promise, Map: Map, Set: Set,
+            Array: Array, Object: Object, String: String, Number: Number, Boolean: Boolean,
+            Error: Error, encodeURIComponent: encodeURIComponent, decodeURIComponent: decodeURIComponent,
+            document: dom.document,
+            location: { hostname: 'www.epicgames.com' },
+            GM_info: { scriptHandler: 'XMonkey', version: '1.2.7' }
+        };
+        sandbox.GM = {
+            xmlHttpRequest: function () { return Promise.resolve(undefined); }
+        };
+        sandbox.GM_xmlhttpRequest = function (cfg) {
+            setTimeout(function () {
+                cfg.onerror({ methodName: 'gmReq', callbackName: 'cb1', readyState: 4, status: -1 });
+            }, 0);
+        };
+        sandbox.window = sandbox;
+        const api = load(sandbox);
+
+        const ok = await api.runEnvCheck();
+        const log = dom.byId.get('epic-export-log').textContent;
+        assertEqual(ok, false, '自检应判为未通过');
+        assertEqual(api.gm4Broken(), true, '应记住 GM4 不可用');
+        assert(log.indexOf('服务端答复') < 0, '不能误判为服务端答复，实际：\n' + log);
+        assert(log.indexOf('请求链路是通的') < 0, '不能误判为链路通畅，实际：\n' + log);
+        assert(log.indexOf('并非 Epic 服务端返回') >= 0, '应点明 -1 非服务端返回，实际：\n' + log);
+
+        const nfErr = api.httpFailure({ status: -1 }, 'https://www.epicgames.com/id/api/redirect');
+        assert(!nfErr.envProblem, 'status=-1 不应标 envProblem');
+        assert(nfErr.message.indexOf('HTTP -1') < 0, '不应报成 HTTP -1：' + nfErr.message);
+    });
 }
 
 async function main() {

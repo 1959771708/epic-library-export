@@ -2,7 +2,7 @@
 // @name         Epic 库存导出
 // @name:en      Epic Library Export
 // @namespace    https://github.com/1959771708/epic-library-export
-// @version      1.5.1
+// @version      1.5.2
 // @description  导出 Epic 账号的完整游戏库存（含从未产生订单的入库记录），输出 JSON 供第三方工具导入
 // @description:en  Export your complete Epic Games library, including titles that never produced an order.
 // @author       1959771708
@@ -71,10 +71,13 @@
 
     function httpFailure(res, url) {
         const st = res && res.status;
-        if (typeof st === 'number') {
+        if (typeof st === 'number' && st >= 100 && st <= 599) {
             const err = new Error('HTTP ' + st + ' · ' + shortUrl(url));
             err.status = st;
             return err;
+        }
+        if (typeof st === 'number' && st <= 0) {
+            return networkError('网络请求失败（status ' + st + '）', url);
         }
         // 环境性失败：同一次点击里连发几次结果完全相同，重试只是白等，故标记为不可重试
         const err = new Error('没拿到 HTTP 响应（响应对象里没有 status）· ' + shortUrl(url)
@@ -272,9 +275,26 @@
 
         let text;
         if (location.hostname === 'www.epicgames.com') {
-            const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
-            if (!r.ok) throw new Error('取授权码失败 HTTP ' + r.status);
-            text = await r.text();
+            try {
+                const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
+                if (!r.ok) throw new Error('取授权码失败 HTTP ' + r.status);
+                text = await r.text();
+            } catch (fetchErr) {
+                // 同源 fetch 抛出网络异常（如 Failed to fetch）时，尝试走 GM 通道兜底；
+                // 若两条路都连不上，则明确提示检查网络/代理或浏览器拦截规则。
+                if (fetchErr && /^取授权码失败 HTTP /.test(fetchErr.message || '')) throw fetchErr;
+                try {
+                    text = await httpText(url, {
+                        headers: { Accept: 'application/json' },
+                        anonymous: false
+                    });
+                } catch (gmErr) {
+                    if (gmErr && gmErr.envProblem) throw gmErr;
+                    const fMsg = (fetchErr && fetchErr.message) || String(fetchErr);
+                    const gMsg = (gmErr && gmErr.message) || String(gmErr);
+                    throw new Error('无法连接 Epic 授权接口（' + fMsg + '；' + gMsg + '），请检查网络/代理或关闭浏览器广告拦截');
+                }
+            }
         } else {
             // 跨站时只能交给 GM；anonymous:false 表示带上目标域的 cookie
             text = await httpText(url, {
@@ -1006,26 +1026,42 @@
             ui.log('    ' + describeRaw(got.raw));
         }
 
+        function isNetCallback(r) {
+            const via = r.got && r.got.via || '';
+            return /onerror|ontimeout/.test(via);
+        }
         function statusOf(r) {
+            if (isNetCallback(r)) return null;
             const st = r.got && r.got.raw && r.got.raw.status;
-            return typeof st === 'number' ? st : null;
+            return (typeof st === 'number' && st >= 100 && st <= 599) ? st : null;
+        }
+        function isNetFailure(r) {
+            if (isNetCallback(r)) return true;
+            const st = r.got && r.got.raw && r.got.raw.status;
+            return typeof st === 'number' && st <= 0;
         }
         const usable = results.filter(function (r) { return statusOf(r) !== null; });
+        const netFailed = results.filter(function (r) { return statusOf(r) === null && isNetFailure(r); });
+        const nameOf = function (n) { return n === 'GM4' ? 'GM.xmlHttpRequest（GM4）' : 'GM_xmlhttpRequest（旧版）'; };
+        const gm4Failed = results.some(function (r) { return r.name === 'GM4' && statusOf(r) === null; });
+        if (gm4Failed) gm4Broken = true;   // 与网络层的自动降级保持一致
 
         // 结论要说到「能不能导出」这个用户真正关心的问题上，而不是停在技术描述。
         let ok = false;
-        if (!usable.length) {
+        if (!usable.length && netFailed.length) {
+            const nf = netFailed[0];
+            const rawSt = nf.got && nf.got.raw && nf.got.raw.status;
+            const stHint = typeof rawSt === 'number' ? '（status = ' + rawSt + '，并非 Epic 服务端返回）' : '';
+            ui.log('✗ ' + nameOf(nf.name) + ' 触发了网络错误' + stHint + '。'
+                + '当前网络或浏览器拦截规则无法连上 www.epicgames.com，请检查代理/加速器或关闭广告拦截后重试。');
+        } else if (!usable.length) {
             gm4Broken = hasGm4();
             ui.log('✗ 两条 GM 通道都没拿到 HTTP 响应，导出无法进行。上面的响应对象就是失败原因，与 Epic 账号和登录状态无关。');
         } else {
             const best = usable[0];
             const st = statusOf(best);
-            const nameOf = function (n) { return n === 'GM4' ? 'GM.xmlHttpRequest（GM4）' : 'GM_xmlhttpRequest（旧版）'; };
-            // 能拿到数字 status 就说明这条链路是通的；非 2xx 是 Epic 那边的答复。
+            // 能拿到有效 HTTP status（100..599）就说明这条链路是通的；非 2xx 是 Epic 那边的答复。
             if (st >= 200 && st < 300) ok = true;
-
-            const gm4Failed = results.some(function (r) { return r.name === 'GM4' && statusOf(r) === null; });
-            if (gm4Failed) gm4Broken = true;   // 与网络层的自动降级保持一致
 
             if (gm4Failed && st >= 200 && st < 300) {
                 ui.log('⚠ 这个管理器的 GM.xmlHttpRequest（GM4）拿不到响应，但旧版 GM_xmlhttpRequest 正常。'
